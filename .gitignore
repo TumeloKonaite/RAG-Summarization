@@ -1,0 +1,14 @@
+﻿.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.log
+chroma_store/
+ollama_models/
+models/
+data/
+tmp/
+.DS_Store
+Thumbs.db
