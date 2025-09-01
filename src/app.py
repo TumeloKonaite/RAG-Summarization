@@ -2,6 +2,7 @@
 # pip install -U langchain langchain-community langchain-ollama langchain-chroma langchain-huggingface chromadb pypdf pymupdf sentence-transformers tqdm
 
 import os, glob, argparse, shutil
+from pathlib import Path
 from tqdm import trange
 from langchain_ollama import ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -22,16 +23,19 @@ except Exception:
     HAS_RERANK = False
 
 # ---- Defaults (can be overridden via CLI) ----
+BASE_DIR        = Path(__file__).resolve().parent
+DOCS_DIR        = BASE_DIR / "docs"                    # expects files under src/docs
+PERSIST_DIR     = BASE_DIR / "chroma_store"            # persisted DB lives next to app.py
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-GEN_MODEL       = "qwen2:7b"              # already pulled
-PERSIST_DIR     = "chroma_store"
+GEN_MODEL       = "qwen2:7b"                            # already pulled
 
 def find_paths(single_file: str | None):
     if single_file:
-        if not os.path.exists(single_file):
+        p = Path(single_file)
+        if not p.exists():
             raise SystemExit(f"[ERROR] File not found: {single_file}")
-        return [single_file]
-    return glob.glob("docs/**/*.pdf", recursive=True) + glob.glob("docs/**/*.txt", recursive=True)
+        return [str(p)]
+    return [str(p) for p in DOCS_DIR.rglob("*.pdf")] + [str(p) for p in DOCS_DIR.rglob("*.txt")]
 
 def load_docs(paths):
     print(f"[INFO] Found {len(paths)} file(s)")
@@ -51,6 +55,11 @@ def load_docs(paths):
         except Exception as e:
             print(f"[WARN] Failed to load {p}: {e}")
     print(f"[INFO] Loaded {len(docs)} docs before splitting")
+
+    # Debug: how many are empty pre-split
+    empties = sum(1 for d in docs if not (d.page_content or "").strip())
+    if empties:
+        print(f"[WARN] {empties} doc(s) appear empty (image-only PDFs?). Consider OCR or .txt conversion.")
     return docs
 
 def chunk_docs(docs, chunk_size: int, chunk_overlap: int):
@@ -60,11 +69,25 @@ def chunk_docs(docs, chunk_size: int, chunk_overlap: int):
     for i, c in enumerate(chunks[:3]):
         snippet = (c.page_content or "").strip().replace("\n", " ")
         print(f"[PREVIEW {i}]: {snippet[:200]}{'...' if len(snippet)>200 else ''}")
+
+    # Debug: count empty chunks
+    empty_chunks = sum(1 for c in chunks if not (c.page_content or "").strip())
+    if empty_chunks:
+        print(f"[WARN] {empty_chunks} / {len(chunks)} chunk(s) are empty; they won't be indexed.")
     return chunks
 
-def build_or_load_index(chunks, rebuild: bool, persist_dir: str, embed_model: str):
+def _collection_count(vdb) -> int:
+    try:
+        return vdb._collection.count()
+    except Exception:
+        return -1
+
+def build_or_load_index(chunks, rebuild: bool, persist_dir: Path, embed_model: str):
+    persist_dir = str(persist_dir)  # Chroma expects str
+
     emb = HuggingFaceEmbeddings(
         model_name=embed_model,
+        # BGE works best with normalized vectors + cosine
         encode_kwargs={"normalize_embeddings": True} if "bge" in embed_model.lower() else {}
     )
 
@@ -72,29 +95,47 @@ def build_or_load_index(chunks, rebuild: bool, persist_dir: str, embed_model: st
         print(f"[INFO] Rebuilding: removing existing index at {persist_dir}")
         shutil.rmtree(persist_dir, ignore_errors=True)
 
-    vectordb = Chroma(persist_directory=persist_dir, embedding_function=emb)
+    # Use explicit cosine space to match normalized embeddings
+    vectordb = Chroma(
+        collection_name="huawei_docs",
+        persist_directory=persist_dir,
+        embedding_function=emb,
+        collection_metadata={"hnsw:space": "cosine"},
+    )
 
-    is_empty = not (os.path.exists(persist_dir) and os.listdir(persist_dir))
-    if is_empty:
+    cnt = _collection_count(vectordb)
+    need_index = cnt <= 0
+    if need_index:
         texts = [c.page_content for c in chunks]
         metas = [c.metadata      for c in chunks]
         BATCH = 256
         print(f"[INFO] Indexing {len(texts)} texts into {persist_dir} ...")
+        added = 0
         for i in trange(0, len(texts), BATCH, desc="Indexing"):
             bt = texts[i:i+BATCH]
             bm = metas[i:i+BATCH]
-            keep = [(t, m) for t, m in zip(bt, bm) if (t or "").strip() != ""]
+            keep = [(t, m) for t, m in zip(bt, bm) if (t or "").strip()]
             if keep:
                 k_texts, k_metas = zip(*keep)
                 vectordb.add_texts(texts=list(k_texts), metadatas=list(k_metas))
-        print("[INFO] Index build complete.")
+                added += len(k_texts)
+        # Note: langchain_chroma.Chroma persists automatically when persist_directory is set.
+        print(f"[INFO] Index build complete. Added {added} texts.")
     else:
-        print(f"[INFO] Using existing Chroma index at {persist_dir}")
+        print(f"[INFO] Using existing Chroma index at {persist_dir} (count={cnt})")
+
+    # Final sanity
+    cnt_after = _collection_count(vectordb)
+    print(f"[DEBUG] Chroma collection count = {cnt_after}")
+    if cnt_after == 0:
+        print("[ERROR] Vector store is empty even after build. Run with --rebuild and ensure docs have text (OCR if PDFs are scanned).")
+        raise SystemExit(1)
 
     return vectordb
 
 def make_retriever(vectordb, k: int, use_rerank: bool):
-    base = vectordb.as_retriever(search_kwargs={"k": max(k, 4) if use_rerank else k})
+    # Simple, reliable baseline first
+    base = vectordb.as_retriever(search_type="similarity", search_kwargs={"k": max(1, k)})
     if use_rerank:
         if not HAS_RERANK:
             print("[WARN] --rerank requested but reranker deps not available; proceeding without rerank.")
@@ -121,7 +162,7 @@ def make_chain(retriever, gen_model: str, base_url: str, num_ctx: int):
         "2) 3–6 action items.\n\n"
         "Question: {question}\n\nContext:\n{context}"
     )
-    def fmt(ds): return "\n\n".join(d.page_content for d in ds)
+    def fmt(ds): return "\n\n".join((d.page_content or "") for d in ds)
     chain = (
         {"context": retriever | fmt, "question": RunnablePassthrough()}
         | prompt | llm | StrOutputParser()
@@ -147,10 +188,20 @@ def main():
     docs   = load_docs(paths)
     chunks = chunk_docs(docs, args.chunk_size, args.chunk_overlap)
     vectordb = build_or_load_index(chunks, rebuild=args.rebuild, persist_dir=PERSIST_DIR, embed_model=args.embed_model)
+
+    # Hard guard: if empty, exit early
+    try:
+        _cnt = _collection_count(vectordb)
+        if _cnt == 0:
+            raise SystemExit("[ERROR] Vector store is empty even after build. Use --rebuild and ensure docs contain text.")
+    except Exception:
+        pass
+
     retriever = make_retriever(vectordb, k=args.k, use_rerank=args.rerank)
 
-    # Pre-flight: ensure retrieval returns something
-    hits = retriever.invoke(args.q)
+    # Pre-flight: ensure retrieval returns something (use an easy query first)
+    sanity_q = args.q or "What is cloud computing?"
+    hits = retriever.invoke(sanity_q)
     print(f"[INFO] Retriever returned {len(hits)} doc(s)")
     if not hits:
         raise SystemExit("[ERROR] Retrieval is empty. If PDFs are image-only, convert to .txt or use OCR.")
