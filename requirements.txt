@@ -1,0 +1,17 @@
+# Core LangChain
+langchain>=0.2.0
+langchain-community>=0.2.0
+
+# Vector store
+chromadb>=0.5.0
+
+# Document loaders
+pypdf>=4.0.0   # for PDFs
+unstructured>=0.15.0  # for Word, HTML, etc. (optional but handy)
+
+# Embeddings / local models
+sentence-transformers>=2.6.0  # if you want HuggingFace embeddings as fallback
+
+# Utils
+python-dotenv>=1.0.1  # to manage environment variables if needed
+tqdm>=4.66.0          # progress bars for ingestion
